@@ -6,6 +6,9 @@
 3. 同一特征连续结束日的窗口合并为一个特征任务；任务顺序为先特征、后切片，去重。
 4. 预览时固化"所见版本指纹"（窗口 id、切片 id、三日源分区修订 id、切片-窗口引用对），
    确认时按当前已提交状态重算指纹，任一集合变化即拒绝旧预览；无关改动不影响确认。
+5. 确认采用两阶段并发控制：只读阶段无锁重算（登记接口照常提交），
+   写入阶段以 BEGIN IMMEDIATE 串行化；锁内复查状态与指纹后才发号落库，
+   保证同一张预览在并发确认下最多发一个确认号，拒绝/失败均不占号、不留单。
 """
 
 from __future__ import annotations
@@ -456,40 +459,126 @@ def _fingerprint_diff(stored: dict, current: dict) -> dict:
     return diff
 
 
+# 参与"所见版本"判断的全部登记表；记录均为只追加、不可变，
+# 因此各自的最大 rowid 单调递增，可作为廉价的已提交状态水位。
+_REGISTERED_TABLES = (
+    "partition_rev",
+    "feature_window",
+    "scoring_slice",
+    "slice_window_ref",
+)
+
+
+def _registry_watermark(conn: sqlite3.Connection) -> dict[str, int]:
+    """各登记表当前最大 rowid（空表为 0），用于确认期内检测是否有新登记提交。"""
+    marks: dict[str, int] = {}
+    for table in _REGISTERED_TABLES:
+        value = conn.execute(f"SELECT COALESCE(MAX(rowid), 0) FROM {table}").fetchone()[0]
+        marks[table] = value
+    return marks
+
+
+def _raise_if_stale(stored_fp: dict, current_fp: dict) -> None:
+    """指纹不一致即预览过期：相关修订/依赖（含新增命中窗口或切片）已变化。"""
+    diff = _fingerprint_diff(stored_fp, current_fp)
+    raise ConflictError(
+        "预览已过期：依赖的分区修订、窗口或切片版本发生变化"
+        "（含新增命中的窗口或切片），"
+        f"差异={json.dumps(diff, ensure_ascii=False)}，请重新生成预览",
+        details={"reason": "preview_stale", "diff": diff},
+    )
+
+
 def confirm_preview(conn: sqlite3.Connection, preview_id: int) -> dict:
+    """确认预览，保证同一张预览在并发确认下只发一个确认号。
+
+    两阶段策略（WAL 下读不阻塞写）：
+    1. 只读阶段：不加任何写锁，重算当前影响面与指纹。期间日分区、特征窗口、
+       评分切片的登记仍可正常提交。
+    2. 写入阶段：``BEGIN IMMEDIATE`` 立即拿到库级写锁后再复查——
+       - 预览已被另一笔确认置为 confirmed -> 409 提示已确认并给出原确认号；
+       - 锁内重查水位/指纹，只读阶段后有相关登记提交（含新增命中）-> 409 预览过期；
+       - 全部一致才在同一事务内消耗发号器并落库；失败整体回滚，不占号、不留单。
+    """
     row = conn.execute(
         "SELECT * FROM preview WHERE id = ?", (preview_id,)
     ).fetchone()
     if row is None:
         raise NotFoundError(f"预览单 {preview_id} 不存在")
     if row["status"] == "confirmed":
+        # 快速路径：已确认的预览永远不再发第二个号
         raise ConflictError(
-            f"预览单 {preview_id} 已确认，确认号 {row['confirmation_no']}"
+            f"预览单 {preview_id} 已确认，确认号 {row['confirmation_no']}，"
+            "每张预览最多发放一个确认号",
+            details={
+                "reason": "already_confirmed",
+                "preview_id": preview_id,
+                "confirmation_no": row["confirmation_no"],
+            },
         )
 
     corrections = [
         CorrectionIn(**item) for item in json.loads(row["corrections_json"])
     ]
-    current = compute_impact(conn, corrections)
     stored_fp = _normalize_fingerprint(
         json.loads(row["snapshot_json"])["fingerprint"]
     )
+
+    # ---- 阶段一：只读重算（无写锁，登记接口照常提交）----
+    current = compute_impact(conn, corrections)
     current_fp = _normalize_fingerprint(impact_fingerprint(current))
     if stored_fp != current_fp:
-        raise ConflictError(
-            "预览已过期：依赖的分区修订、窗口或切片版本发生变化，"
-            f"差异={json.dumps(_fingerprint_diff(stored_fp, current_fp), ensure_ascii=False)}，"
-            "请重新生成预览"
-        )
+        _raise_if_stale(stored_fp, current_fp)
+    watermark = _registry_watermark(conn)
 
-    seq_row = conn.execute("INSERT INTO order_seq DEFAULT VALUES")
-    seq = seq_row.lastrowid
-    confirmation_no = f"CF-{datetime.now(timezone.utc):%Y%m%d}-{seq:06d}"
-    conn.execute(
-        "UPDATE preview SET status = 'confirmed', confirmation_no = ?, "
-        "confirmed_at = ? WHERE id = ?",
-        (confirmation_no, now_iso(), preview_id),
-    )
+    # ---- 阶段二：立即写锁内复查并落库，串行化所有确认 ----
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        locked = conn.execute(
+            "SELECT * FROM preview WHERE id = ?", (preview_id,)
+        ).fetchone()
+        if locked is None:  # 理论上不可达（记录不可删），防御性处理
+            raise NotFoundError(f"预览单 {preview_id} 不存在")
+        if locked["status"] == "confirmed":
+            # 并发的另一笔确认已抢先成功：不发新号，回滚本事务并返回原号
+            raise ConflictError(
+                f"预览单 {preview_id} 已确认，确认号 {locked['confirmation_no']}，"
+                "每张预览最多发放一个确认号",
+                details={
+                    "reason": "already_confirmed",
+                    "preview_id": preview_id,
+                    "confirmation_no": locked["confirmation_no"],
+                },
+            )
+
+        # 只读阶段之后若有任何新登记提交，锁内重新重算指纹；
+        # 无变化则直接复用阶段一结果，把锁持有时间压到最短。
+        if _registry_watermark(conn) != watermark:
+            latest = compute_impact(conn, corrections)
+            latest_fp = _normalize_fingerprint(impact_fingerprint(latest))
+            if stored_fp != latest_fp:
+                _raise_if_stale(stored_fp, latest_fp)
+            current = latest
+
+        # 发号器与状态更新在同一事务内：提交失败整体回滚，序号不消耗
+        seq_row = conn.execute("INSERT INTO order_seq DEFAULT VALUES")
+        seq = seq_row.lastrowid
+        confirmation_no = f"CF-{datetime.now(timezone.utc):%Y%m%d}-{seq:06d}"
+        updated = conn.execute(
+            "UPDATE preview SET status = 'confirmed', confirmation_no = ?, "
+            "confirmed_at = ? WHERE id = ? AND status = 'open'",
+            (confirmation_no, now_iso(), preview_id),
+        )
+        if updated.rowcount != 1:
+            # 最后一道防线：状态已被并发事务改写则回滚，绝不覆盖原确认号
+            raise ConflictError(
+                f"预览单 {preview_id} 已被并发确认，请查询原确认号",
+                details={"reason": "already_confirmed", "preview_id": preview_id},
+            )
+    except Exception:
+        conn.rollback()
+        raise
+    # 事务交由路由层 commit；commit 失败同样整体回滚（不占号、不留单）
     return {
         "preview_id": preview_id,
         "confirmation_no": confirmation_no,

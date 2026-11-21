@@ -130,7 +130,7 @@
       <input id="confirm-id" placeholder="预览单号 preview_id" style="max-width:220px">
       <button class="primary" onclick="submitConfirm()">按所见版本确认</button>
     </div>
-    <p class="hint">确认期间若相关分区修订/窗口/切片版本变化（含新增命中），旧预览会被拒绝；无关改动仍可确认。</p>
+    <p class="hint">同一张预览最多发一个确认号：两个窗口同时确认时，后到者提示"已确认"并返回原确认号。确认期间若相关分区修订/窗口/切片版本变化（含新增命中），旧预览提示过期；无关登记仍可确认。</p>
     <pre id="cf-out" hidden></pre>
   </section>
 
@@ -182,7 +182,12 @@ async function api(path, opts = {}) {
     ...opts,
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data?.error?.message || ("HTTP " + res.status));
+  if (!res.ok) {
+    const err = new Error(data?.error?.message || ("HTTP " + res.status));
+    err.status = res.status;
+    err.details = data?.error?.details || null;
+    throw err;
+  }
   return data;
 }
 // 页签
@@ -305,7 +310,17 @@ async function submitConfirm() {
     showMsg(true, "确认成功，确认号 " + data.confirmation_no);
     $("cf-no").value = data.confirmation_no;
     showOut("cf-out", data);
-  } catch (e) { showMsg(false, e.message); showOut("cf-out", e.message); }
+  } catch (e) {
+    // 并发确认：另一窗口已确认成功时，后端给出原确认号，直接带回追溯框
+    const originalNo = e.details?.confirmation_no;
+    if (originalNo) {
+      $("cf-no").value = originalNo;
+      showMsg(false, e.message + "（可直接在下方按该确认号追溯原单）");
+    } else {
+      showMsg(false, e.message);
+    }
+    showOut("cf-out", e.details ? { error: e.message, details: e.details } : e.message);
+  }
 }
 async function lookupOrder() {
   try {
