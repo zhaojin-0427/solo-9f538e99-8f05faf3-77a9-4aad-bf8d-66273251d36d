@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>风机振动分区更正补算清单</title>
+<style>
+  :root { --line:#d7dde5; --blue:#1f5fa8; --bg:#f5f7fa; --ok:#1a7f4b; --err:#b3261e; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: "PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+         background:var(--bg); color:#1c2733; }
+  header { background:var(--blue); color:#fff; padding:14px 24px; }
+  header h1 { margin:0; font-size:18px; }
+  header p { margin:4px 0 0; font-size:12px; opacity:.85; }
+  nav { display:flex; gap:4px; padding:0 16px; background:#0f4378; flex-wrap:wrap; }
+  nav button { background:none; border:0; color:#cfe0f5; padding:12px 18px;
+               cursor:pointer; font-size:14px; border-bottom:3px solid transparent; }
+  nav button.active { color:#fff; border-bottom-color:#ffd34d; }
+  main { padding:20px 24px; max-width:1180px; margin:0 auto; }
+  .panel { display:none; background:#fff; border:1px solid var(--line);
+           border-radius:8px; padding:18px 20px; }
+  .panel.active { display:block; }
+  h2 { margin:0 0 6px; font-size:16px; }
+  .hint { color:#5c6b7a; font-size:12px; margin:0 0 14px; }
+  label { display:block; font-size:12px; color:#3a4a5a; margin:10px 0 4px; }
+  input, select { width:100%; padding:8px 10px; border:1px solid var(--line);
+                  border-radius:6px; font-size:13px; }
+  .row { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
+  .row2 { display:grid; grid-template-columns:repeat(2,1fr); gap:12px; }
+  .actions { margin-top:16px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  button.primary { background:var(--blue); color:#fff; border:0; border-radius:6px;
+                   padding:9px 20px; font-size:14px; cursor:pointer; }
+  button.ghost { background:#fff; border:1px solid var(--line); border-radius:6px;
+                 padding:8px 14px; cursor:pointer; font-size:13px; }
+  button.danger { color:var(--err); border-color:#e3b2ae; }
+  .ref-card, .corr-card { border:1px dashed var(--line); border-radius:6px;
+                          padding:10px 12px; margin-top:10px; background:#fafcff; }
+  .ref-head, .corr-head { display:flex; justify-content:space-between; align-items:center; }
+  .ref-head span { font-size:12px; font-weight:600; color:var(--blue); }
+  pre { background:#101820; color:#d7e3ee; padding:14px; border-radius:8px;
+        font-size:12px; overflow:auto; max-height:520px; white-space:pre-wrap;
+        word-break:break-word; }
+  .msg { padding:10px 14px; border-radius:6px; font-size:13px; margin-bottom:14px;
+         display:none; }
+  .msg.ok { display:block; background:#e6f4ec; color:var(--ok); border:1px solid #b7dcc7; }
+  .msg.err { display:block; background:#fbe9e7; color:var(--err); border:1px solid #f0c2be; }
+  table { width:100%; border-collapse:collapse; font-size:12px; margin-top:8px; }
+  th, td { border:1px solid var(--line); padding:6px 8px; text-align:left; }
+  th { background:#eef2f7; }
+  .tag { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; }
+  .tag.open { background:#fff3cd; color:#8a6d1c; }
+  .tag.confirmed { background:#d9f0e3; color:var(--ok); }
+  .small { font-size:12px; color:#5c6b7a; }
+</style>
+</head>
+<body>
+<header>
+  <h1>风机振动分区更正 · 补算清单与确认追溯</h1>
+  <p>三日特征窗口（结束日及前两日） · 告警评分切片版本引用 · 按所见版本确认 · 确认号追溯</p>
+</header>
+<nav id="nav">
+  <button data-tab="partition" class="active">分区修订上传</button>
+  <button data-tab="window">特征窗口登记</button>
+  <button data-tab="slice">评分切片登记</button>
+  <button data-tab="preview">更正预览/确认</button>
+  <button data-tab="lookup">确认单追溯</button>
+  <button data-tab="data">当前登记数据</button>
+</nav>
+<main>
+  <div id="msg" class="msg"></div>
+
+  <!-- 分区修订 -->
+  <section class="panel active" id="panel-partition">
+    <h2>上传风机分区修订</h2>
+    <p class="hint">同一风机同一 UTC 日期的修订号必须严格递增；源分区再次更正请用更大的修订号。</p>
+    <div class="row">
+      <div><label>风机编号 turbine_id</label><input id="p-turbine" placeholder="WT-01"></div>
+      <div><label>UTC 日期 utc_date</label><input id="p-date" type="date"></div>
+      <div><label>递增修订号 revision</label><input id="p-rev" type="number" min="1" placeholder="1"></div>
+    </div>
+    <div class="actions"><button class="primary" onclick="submitPartition()">上传分区修订</button></div>
+    <pre id="p-out" hidden></pre>
+  </section>
+
+  <!-- 特征窗口 -->
+  <section class="panel" id="panel-window">
+    <h2>登记三日特征窗口</h2>
+    <p class="hint">窗口覆盖结束日及前两日；版本号留空则自动取当前最大版本 +1。</p>
+    <div class="row2">
+      <div><label>风机编号</label><input id="w-turbine" placeholder="WT-01"></div>
+      <div><label>特征名 feature_name</label><input id="w-feature" placeholder="vibration_rms"></div>
+    </div>
+    <div class="row2">
+      <div><label>窗口结束日 end_date</label><input id="w-end" type="date"></div>
+      <div><label>版本号 version（可空）</label><input id="w-ver" type="number" min="1" placeholder="自动递增"></div>
+    </div>
+    <div class="actions"><button class="primary" onclick="submitWindow()">登记窗口版本</button></div>
+    <pre id="w-out" hidden></pre>
+  </section>
+
+  <!-- 评分切片 -->
+  <section class="panel" id="panel-slice">
+    <h2>登记告警评分切片</h2>
+    <p class="hint">切片按所见版本引用一个或多个特征窗口；引用窗口必须属于同一风机。</p>
+    <div class="row2">
+      <div><label>风机编号</label><input id="s-turbine" placeholder="WT-01"></div>
+      <div><label>切片名 slice_name</label><input id="s-name" placeholder="daily_alert_score"></div>
+    </div>
+    <label>版本号 version（可空，自动递增）</label>
+    <input id="s-ver" type="number" min="1" placeholder="自动递增" style="max-width:300px">
+    <div id="s-refs"></div>
+    <div class="actions">
+      <button class="ghost" onclick="addRef()">+ 添加窗口引用</button>
+      <button class="primary" onclick="submitSlice()">登记切片版本</button>
+    </div>
+    <pre id="s-out" hidden></pre>
+  </section>
+
+  <!-- 预览与确认 -->
+  <section class="panel" id="panel-preview">
+    <h2>生成更正补算清单预览</h2>
+    <p class="hint">按当前已提交状态找出受影响窗口与切片，合并同特征连续日期，先特征后切片排序。</p>
+    <div id="corrs"></div>
+    <div class="actions">
+      <button class="ghost" onclick="addCorr()">+ 添加更正点</button>
+      <button class="primary" onclick="submitPreview()">生成预览</button>
+    </div>
+    <pre id="pv-out" hidden></pre>
+    <div class="actions">
+      <input id="confirm-id" placeholder="预览单号 preview_id" style="max-width:220px">
+      <button class="primary" onclick="submitConfirm()">按所见版本确认</button>
+    </div>
+    <p class="hint">确认期间若相关分区修订/窗口/切片版本变化（含新增命中），旧预览会被拒绝；无关改动仍可确认。</p>
+    <pre id="cf-out" hidden></pre>
+  </section>
+
+  <!-- 追溯 -->
+  <section class="panel" id="panel-lookup">
+    <h2>按确认号打开旧单</h2>
+    <p class="hint">依赖换版、源分区再次更正并重启后，仍凭留存的源修订、窗口及切片引用复算原清单，逐切片列出命中窗口与源修订号。</p>
+    <div class="row2">
+      <div><label>确认号 confirmation_no</label><input id="cf-no" placeholder="CF-20261120-000001"></div>
+      <div style="align-self:end"><button class="primary" onclick="lookupOrder()">复算原清单</button></div>
+    </div>
+    <label style="margin-top:16px">或按预览单号打开</label>
+    <div class="row2">
+      <div><input id="pv-id" placeholder="preview_id"></div>
+      <div style="align-self:end"><button class="ghost" onclick="lookupPreview()">打开预览单</button></div>
+    </div>
+    <pre id="lk-out" hidden></pre>
+  </section>
+
+  <!-- 数据浏览 -->
+  <section class="panel" id="panel-data">
+    <h2>当前登记数据</h2>
+    <p class="hint">版本化事实记录不可变；同版分区/窗口/切片可被多张确认单共用。</p>
+    <div class="actions">
+      <button class="ghost" onclick="loadData('partitions')">分区修订</button>
+      <button class="ghost" onclick="loadData('windows')">特征窗口</button>
+      <button class="ghost" onclick="loadData('slices')">评分切片</button>
+      <button class="ghost" onclick="loadData('previews')">预览/确认单</button>
+    </div>
+    <div id="data-table"></div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+function showMsg(ok, text) {
+  const el = $("msg");
+  el.className = "msg " + (ok ? "ok" : "err");
+  el.textContent = text;
+}
+function showOut(id, data) {
+  const el = $(id);
+  el.hidden = false;
+  el.textContent = typeof data === "string" ? data : JSON.stringify(data, null, 2);
+}
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    headers: { "Content-Type": "application/json" },
+    ...opts,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.error?.message || ("HTTP " + res.status));
+  return data;
+}
+// 页签
+document.querySelectorAll("#nav button").forEach((btn) => {
+  btn.onclick = () => {
+    document.querySelectorAll("#nav button").forEach(b => b.classList.remove("active"));
+    document.querySelectorAll(".panel").forEach(p => p.classList.remove("active"));
+    btn.classList.add("active");
+    $("panel-" + btn.dataset.tab).classList.add("active");
+    $("msg").className = "msg";
+  };
+});
+
+// 分区
+async function submitPartition() {
+  try {
+    const data = await api("/api/partitions", { method: "POST", body: JSON.stringify({
+      turbine_id: $("p-turbine").value.trim(),
+      utc_date: $("p-date").value,
+      revision: Number($("p-rev").value),
+    })});
+    showMsg(true, "分区修订已登记，id=" + data.id);
+    showOut("p-out", data);
+  } catch (e) { showMsg(false, e.message); }
+}
+
+// 窗口
+async function submitWindow() {
+  const v = $("w-ver").value;
+  try {
+    const body = {
+      turbine_id: $("w-turbine").value.trim(),
+      feature_name: $("w-feature").value.trim(),
+      end_date: $("w-end").value,
+    };
+    if (v) body.version = Number(v);
+    const data = await api("/api/windows", { method: "POST", body: JSON.stringify(body) });
+    showMsg(true, "窗口版本已登记，id=" + data.id + "，version=" + data.version);
+    showOut("w-out", data);
+  } catch (e) { showMsg(false, e.message); }
+}
+
+// 切片引用行
+let refSeq = 0;
+function addRef() {
+  const i = ++refSeq;
+  const div = document.createElement("div");
+  div.className = "ref-card";
+  div.id = "ref-" + i;
+  div.innerHTML = `
+    <div class="ref-head"><span>窗口引用 #${i}</span>
+      <button class="ghost danger" onclick="$('ref-${i}').remove()">删除</button></div>
+    <div class="row2">
+      <div><label>风机编号</label><input class="r-turbine" placeholder="WT-01"></div>
+      <div><label>特征名</label><input class="r-feature" placeholder="vibration_rms"></div>
+    </div>
+    <div class="row2">
+      <div><label>窗口结束日</label><input class="r-end" type="date"></div>
+      <div><label>窗口版本号</label><input class="r-ver" type="number" min="1"></div>
+    </div>`;
+  $("s-refs").appendChild(div);
+}
+async function submitSlice() {
+  const refs = [...document.querySelectorAll(".ref-card")].map(card => ({
+    turbine_id: card.querySelector(".r-turbine").value.trim(),
+    feature_name: card.querySelector(".r-feature").value.trim(),
+    end_date: card.querySelector(".r-end").value,
+    version: Number(card.querySelector(".r-ver").value),
+  }));
+  const body = {
+    turbine_id: $("s-turbine").value.trim(),
+    slice_name: $("s-name").value.trim(),
+    window_refs: refs,
+  };
+  const v = $("s-ver").value;
+  if (v) body.version = Number(v);
+  try {
+    const data = await api("/api/slices", { method: "POST", body: JSON.stringify(body) });
+    showMsg(true, "切片版本已登记，id=" + data.id + "，version=" + data.version);
+    showOut("s-out", data);
+  } catch (e) { showMsg(false, e.message); }
+}
+
+// 更正点
+let corrSeq = 0;
+function addCorr(turbine = "", day = "") {
+  const i = ++corrSeq;
+  const div = document.createElement("div");
+  div.className = "corr-card";
+  div.id = "corr-" + i;
+  div.innerHTML = `
+    <div class="corr-head"><span>更正点 #${i}</span>
+      <button class="ghost danger" onclick="$('corr-${i}').remove()">删除</button></div>
+    <div class="row2">
+      <div><label>风机编号</label><input class="c-turbine" value="${turbine}" placeholder="WT-01"></div>
+      <div><label>被更正分区 UTC 日期</label><input class="c-date" type="date" value="${day}"></div>
+    </div>`;
+  $("corrs").appendChild(div);
+}
+async function submitPreview() {
+  const corrections = [...document.querySelectorAll(".corr-card")].map(card => ({
+    turbine_id: card.querySelector(".c-turbine").value.trim(),
+    utc_date: card.querySelector(".c-date").value,
+  }));
+  try {
+    const data = await api("/api/previews", { method: "POST",
+      body: JSON.stringify({ corrections }) });
+    showMsg(true, "预览已生成，preview_id=" + data.preview_id +
+      "，特征任务 " + data.impact.feature_tasks.length +
+      " 个，切片任务 " + data.impact.slice_tasks.length + " 个");
+    $("confirm-id").value = data.preview_id;
+    showOut("pv-out", data);
+  } catch (e) { showMsg(false, e.message); }
+}
+async function submitConfirm() {
+  const id = $("confirm-id").value.trim();
+  try {
+    const data = await api(`/api/previews/${encodeURIComponent(id)}/confirm`,
+      { method: "POST" });
+    showMsg(true, "确认成功，确认号 " + data.confirmation_no);
+    $("cf-no").value = data.confirmation_no;
+    showOut("cf-out", data);
+  } catch (e) { showMsg(false, e.message); showOut("cf-out", e.message); }
+}
+async function lookupOrder() {
+  try {
+    const data = await api("/api/orders/" + encodeURIComponent($("cf-no").value.trim()));
+    showMsg(true, "已按留存引用复算原清单（确认号 " + data.confirmation_no + "）");
+    showOut("lk-out", data);
+  } catch (e) { showMsg(false, e.message); }
+}
+async function lookupPreview() {
+  try {
+    const data = await api("/api/previews/" + encodeURIComponent($("pv-id").value.trim()));
+    showMsg(true, "预览单已打开");
+    showOut("lk-out", data);
+  } catch (e) { showMsg(false, e.message); }
+}
+
+// 数据浏览
+const COLS = {
+  partitions: ["id","turbine_id","utc_date","revision","created_at"],
+  windows: ["id","turbine_id","feature_name","end_date","version","created_at"],
+  slices: ["id","turbine_id","slice_name","version","window_ids","created_at"],
+  previews: ["id","status","confirmation_no","created_at","confirmed_at","corrections"],
+};
+async function loadData(kind) {
+  const data = await api("/api/" + kind);
+  const cols = COLS[kind];
+  let html = "<table><thead><tr>" + cols.map(c => `<th>${c}</th>`).join("") + "</tr></thead><tbody>";
+  for (const row of data) {
+    html += "<tr>" + cols.map(c => {
+      let val = row[c];
+      if (c === "status" && val) val = `<span class="tag ${val}">${val}</span>`;
+      if (typeof val === "object") val = JSON.stringify(val);
+      if (val === null || val === undefined) val = "";
+      return `<td>${val}</td>`;
+    }).join("") + "</tr>";
+  }
+  html += "</tbody></table>" + `<p class="small">共 ${data.length} 条</p>`;
+  $("data-table").innerHTML = html;
+}
+
+// 初始各加一行
+addRef();
+addCorr();
+</script>
+</body>
+</html>

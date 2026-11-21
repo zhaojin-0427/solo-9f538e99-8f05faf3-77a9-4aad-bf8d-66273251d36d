@@ -1,0 +1,15 @@
+services:
+  vibration-api:
+    build: .
+    image: vibration-recompute-api:latest
+    container_name: vibration-recompute-api
+    ports:
+      - "8000:8000"
+    environment:
+      APP_DB_PATH: /data/vibration.db
+    volumes:
+      - vibration-data:/data
+    restart: unless-stopped
+
+volumes:
+  vibration-data:
